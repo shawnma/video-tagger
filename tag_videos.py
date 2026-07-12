@@ -162,8 +162,16 @@ def compress(src: Path, tmp_dir: Path) -> Path:
     return dst
 
 
-def describe(client: genai.Client, clip: Path, model: str = MODEL, retries: int = 4) -> tuple[str, str, int, int]:
+def describe(client: genai.Client, clip: Path, model: str = MODEL, retries: int = 4,
+             people: str = "") -> tuple[str, str, int, int]:
     """上传压缩片段并生成描述。返回 (描述, 文件名短语, 输入token, 输出token)。"""
+    prompt = PROMPT
+    if people:
+        prompt = (
+            f"以下是这个家庭视频库的人物名册,供辨认人物使用:\n\n{people}\n\n"
+            "请结合视频拍摄画面、声音和名册推断出现的是谁,有把握时在描述和文件名里直接用名字;"
+            "拿不准就用泛称,不要猜。\n\n" + PROMPT
+        )
     uploaded = client.files.upload(file=str(clip))
     try:
         deadline = time.monotonic() + 300
@@ -180,7 +188,7 @@ def describe(client: genai.Client, clip: Path, model: str = MODEL, retries: int 
             try:
                 resp = client.models.generate_content(
                     model=model,
-                    contents=[uploaded, PROMPT],
+                    contents=[uploaded, prompt],
                     config=genai_types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=RESPONSE_SCHEMA,
@@ -282,7 +290,7 @@ def process_one(client: genai.Client, args, folder: Path, tmp_dir: Path, video: 
     try:
         if args.sleep:
             time.sleep(args.sleep)
-        desc, slug, tok_in, tok_out = describe(client, clip, model=args.model)
+        desc, slug, tok_in, tok_out = describe(client, clip, model=args.model, people=args.people_text)
     finally:
         clip.unlink(missing_ok=True)
 
@@ -325,6 +333,8 @@ def main() -> int:
     parser.add_argument("--no-rename", action="store_true", help="只写元数据,不改文件名")
     parser.add_argument("--model", default=MODEL, help=f"Gemini 模型名(默认 {MODEL})")
     parser.add_argument("--workers", type=int, default=4, help="并行处理数(默认 4)")
+    parser.add_argument("--people", type=Path, default=None,
+                        help="人物名册文本文件,帮助模型认出家庭成员(样例见 people.example.txt)")
     parser.add_argument("--sleep", type=float, default=0, help="每个视频之间的间隔秒数(免费额度限速时用)")
     args = parser.parse_args()
 
@@ -334,6 +344,13 @@ def main() -> int:
     if not os.environ.get("GEMINI_API_KEY") and not os.environ.get("GOOGLE_API_KEY"):
         print("错误:请先设置 GEMINI_API_KEY 环境变量(在 aistudio.google.com 免费申请)", file=sys.stderr)
         return 1
+
+    args.people_text = ""
+    if args.people:
+        if not args.people.is_file():
+            print(f"错误:名册文件不存在: {args.people}", file=sys.stderr)
+            return 1
+        args.people_text = args.people.read_text(encoding="utf-8").strip()
 
     client = genai.Client()
     csv_path = args.folder / CSV_NAME
