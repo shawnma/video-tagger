@@ -6,6 +6,7 @@
 """
 
 import argparse
+import concurrent.futures
 import csv
 import datetime
 import hashlib
@@ -15,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -260,6 +262,55 @@ def append_csv(csv_path: Path, row: dict) -> None:
         writer.writerow(row)
 
 
+_rename_lock = threading.Lock()  # 并行时防止两个视频抢同一个目标文件名
+
+
+def process_one(client: genai.Client, args, folder: Path, tmp_dir: Path, video: Path) -> dict:
+    """处理单个视频,供线程池调用。返回结果字典,kind ∈ skipped/dry/done。"""
+    rel = video.relative_to(folder)
+    existing, shot_date = read_metadata(video)
+    if existing and existing.startswith(TAG_PREFIX) and not args.force:
+        return {"kind": "skipped", "rel": rel}
+
+    start = time.monotonic()
+    clip = compress(video, tmp_dir)
+    try:
+        if args.sleep:
+            time.sleep(args.sleep)
+        desc, slug, tok_in, tok_out = describe(client, clip, model=args.model)
+    finally:
+        clip.unlink(missing_ok=True)
+
+    new_stem = f"{shot_date}-{sanitize_slug(slug)}"
+    if args.dry_run:
+        return {
+            "kind": "dry", "rel": rel, "desc": desc,
+            "new_name": f"{new_stem}{video.suffix.lower()}",
+            "tok_in": tok_in, "tok_out": tok_out,
+        }
+
+    if video.suffix.lower() in EMBEDDABLE_EXTS:
+        embed_description(video, desc)
+        status = "ok"
+    else:
+        status = "csv-only"  # avi/mkv 无法嵌入,只记录到 CSV
+    new_rel = rel
+    final_path = video
+    if not args.no_rename:
+        with _rename_lock:
+            target = unique_target(video, new_stem, video.suffix.lower())
+            if target != video:
+                video.rename(target)
+        final_path = target
+        new_rel = target.relative_to(folder)
+    set_finder_comment(final_path, TAG_PREFIX + desc)
+    return {
+        "kind": "done", "rel": rel, "new_rel": new_rel, "desc": desc,
+        "status": status, "tok_in": tok_in, "tok_out": tok_out,
+        "seconds": round(time.monotonic() - start, 1),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="自动为视频生成中文内容备注")
     parser.add_argument("folder", type=Path, help="视频所在文件夹(递归扫描)")
@@ -268,6 +319,7 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="重新处理已有 [AI] 描述的视频")
     parser.add_argument("--no-rename", action="store_true", help="只写元数据,不改文件名")
     parser.add_argument("--model", default=MODEL, help=f"Gemini 模型名(默认 {MODEL})")
+    parser.add_argument("--workers", type=int, default=4, help="并行处理数(默认 4)")
     parser.add_argument("--sleep", type=float, default=0, help="每个视频之间的间隔秒数(免费额度限速时用)")
     args = parser.parse_args()
 
@@ -288,68 +340,62 @@ def main() -> int:
     done = skipped = failed = 0
     total_in = total_out = 0
 
-    with tempfile.TemporaryDirectory(prefix="video-tagger-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="video-tagger-") as tmp, \
+         concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         tmp_dir = Path(tmp)
-        for i, video in enumerate(videos, 1):
+        futures = {
+            pool.submit(process_one, client, args, args.folder, tmp_dir, v): v
+            for v in videos
+        }
+        n = 0
+        aborted = False
+        for fut in concurrent.futures.as_completed(futures):
+            video = futures[fut]
             rel = video.relative_to(args.folder)
-            existing, shot_date = read_metadata(video)
-            if existing and existing.startswith(TAG_PREFIX) and not args.force:
-                print(f"[{i}/{len(videos)}] 跳过(已有描述): {rel}")
-                skipped += 1
-                continue
-
-            start = time.monotonic()
+            n += 1
             try:
-                clip = compress(video, tmp_dir)
-                desc, slug, tok_in, tok_out = describe(client, clip, model=args.model)
-                clip.unlink(missing_ok=True)
-                total_in += tok_in
-                total_out += tok_out
-
-                new_stem = f"{shot_date}-{sanitize_slug(slug)}"
-                if args.dry_run:
-                    new_name = f"{new_stem}{video.suffix.lower()}"
-                    print(f"[{i}/{len(videos)}] (dry-run) {rel}\n    → {desc}\n    → 新文件名: {new_name}")
-                else:
-                    if video.suffix.lower() in EMBEDDABLE_EXTS:
-                        embed_description(video, desc)
-                        status = "ok"
-                    else:
-                        status = "csv-only"  # avi/mkv 无法嵌入,只记录到 CSV
-                    new_rel = rel
-                    final_path = video
-                    if not args.no_rename:
-                        target = unique_target(video, new_stem, video.suffix.lower())
-                        if target != video:
-                            video.rename(target)
-                        final_path = target
-                        new_rel = target.relative_to(args.folder)
-                    set_finder_comment(final_path, TAG_PREFIX + desc)
-                    append_csv(csv_path, {
-                        "path": str(rel), "new_path": str(new_rel),
-                        "description": desc, "status": status,
-                        "input_tokens": tok_in, "output_tokens": tok_out,
-                        "seconds": round(time.monotonic() - start, 1),
-                    })
-                    note = "(仅记入 CSV,该格式无法嵌入)" if status == "csv-only" else ""
-                    print(f"[{i}/{len(videos)}] 完成{note}: {rel} → {new_rel}\n    → {desc}")
-                done += 1
+                r = fut.result()
             except BillingError as e:
+                if not aborted:
+                    aborted = True
+                    print(f"\n中止:API 额度已耗尽,请到 https://ai.studio/projects 处理账单后重跑。\n{e}", file=sys.stderr)
+                    for pending in futures:
+                        pending.cancel()
                 failed += 1
-                print(f"\n中止:API 额度已耗尽,请到 https://ai.studio/projects 处理账单后重跑。\n{e}", file=sys.stderr)
-                break
+                continue
+            except concurrent.futures.CancelledError:
+                continue
             except Exception as e:
                 failed += 1
-                print(f"[{i}/{len(videos)}] 失败: {rel} — {e}", file=sys.stderr)
+                print(f"[{n}/{len(videos)}] 失败: {rel} — {e}", file=sys.stderr)
                 if not args.dry_run:
                     append_csv(csv_path, {
                         "path": str(rel), "new_path": str(rel),
                         "description": "", "status": f"error: {e}",
-                        "input_tokens": 0, "output_tokens": 0,
-                        "seconds": round(time.monotonic() - start, 1),
+                        "input_tokens": 0, "output_tokens": 0, "seconds": 0,
                     })
-            if args.sleep:
-                time.sleep(args.sleep)
+                continue
+
+            if r["kind"] == "skipped":
+                skipped += 1
+                print(f"[{n}/{len(videos)}] 跳过(已有描述): {r['rel']}")
+            elif r["kind"] == "dry":
+                done += 1
+                total_in += r["tok_in"]
+                total_out += r["tok_out"]
+                print(f"[{n}/{len(videos)}] (dry-run) {r['rel']}\n    → {r['desc']}\n    → 新文件名: {r['new_name']}")
+            else:
+                done += 1
+                total_in += r["tok_in"]
+                total_out += r["tok_out"]
+                append_csv(csv_path, {
+                    "path": str(r["rel"]), "new_path": str(r["new_rel"]),
+                    "description": r["desc"], "status": r["status"],
+                    "input_tokens": r["tok_in"], "output_tokens": r["tok_out"],
+                    "seconds": r["seconds"],
+                })
+                note = "(仅记入 CSV,该格式无法嵌入)" if r["status"] == "csv-only" else ""
+                print(f"[{n}/{len(videos)}] 完成{note}: {r['rel']} → {r['new_rel']}\n    → {r['desc']}")
 
     cost = total_in / 1e6 * PRICE_INPUT + total_out / 1e6 * PRICE_OUTPUT
     print(
