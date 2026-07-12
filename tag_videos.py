@@ -163,14 +163,19 @@ def compress(src: Path, tmp_dir: Path) -> Path:
 
 
 def describe(client: genai.Client, clip: Path, model: str = MODEL, retries: int = 4,
-             people: str = "") -> tuple[str, str, int, int]:
+             people: str = "", shot_date: str = "") -> tuple[str, str, int, int]:
     """上传压缩片段并生成描述。返回 (描述, 文件名短语, 输入token, 输出token)。"""
     prompt = PROMPT
     if people:
+        date_line = f"这个视频拍摄于 {shot_date}。\n" if shot_date else ""
         prompt = (
+            f"{date_line}"
             f"以下是这个家庭视频库的人物名册,供辨认人物使用:\n\n{people}\n\n"
-            "请结合视频拍摄画面、声音和名册推断出现的是谁,有把握时在描述和文件名里直接用名字;"
-            "拿不准就用泛称,不要猜。\n\n" + PROMPT
+            "辨认规则:\n"
+            "1. 以上面给出的拍摄日期为准(不要自己猜年份),用它减去出生日期算出每个孩子当时的年龄,"
+            "只有年龄和画面中人物外貌相符才能认定是那个人;出生日期晚于拍摄日期的人绝不可能出现。\n"
+            "2. 描述和文件名里统一使用名册中每人的第一个名字(主名),不要混用小名或别名。\n"
+            "3. 有把握才写名字,拿不准就用泛称,不要猜。\n\n" + PROMPT
         )
     uploaded = client.files.upload(file=str(clip))
     try:
@@ -290,7 +295,10 @@ def process_one(client: genai.Client, args, folder: Path, tmp_dir: Path, video: 
     try:
         if args.sleep:
             time.sleep(args.sleep)
-        desc, slug, tok_in, tok_out = describe(client, clip, model=args.model, people=args.people_text)
+        desc, slug, tok_in, tok_out = describe(
+            client, clip, model=args.model,
+            people=args.people_text, shot_date=shot_date,
+        )
     finally:
         clip.unlink(missing_ok=True)
 
