@@ -196,6 +196,23 @@ def embed_description(path: Path, description: str) -> None:
         raise RuntimeError(f"exiftool 写入失败: {result.stderr.strip()[:300]}")
 
 
+def set_finder_comment(path: Path, comment: str) -> None:
+    """写 Finder 注释(⌘I 可见、Spotlight 可搜)。失败只警告,不影响主流程。"""
+    result = subprocess.run(
+        [
+            "osascript",
+            "-e", "on run argv",
+            "-e", 'tell application "Finder" to set comment of '
+                  "(POSIX file (item 1 of argv) as alias) to (item 2 of argv)",
+            "-e", "end run",
+            str(path), comment,
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"    警告:Finder 注释写入失败({result.stderr.strip()[:120]})", file=sys.stderr)
+
+
 def append_csv(csv_path: Path, row: dict) -> None:
     fields = ["path", "new_path", "description", "status", "input_tokens", "output_tokens", "seconds"]
     new_file = not csv_path.exists()
@@ -263,11 +280,14 @@ def main() -> int:
                     else:
                         status = "csv-only"  # avi/mkv 无法嵌入,只记录到 CSV
                     new_rel = rel
+                    final_path = video
                     if not args.no_rename:
                         target = unique_target(video, new_stem, video.suffix.lower())
                         if target != video:
                             video.rename(target)
+                        final_path = target
                         new_rel = target.relative_to(args.folder)
+                    set_finder_comment(final_path, TAG_PREFIX + desc)
                     append_csv(csv_path, {
                         "path": str(rel), "new_path": str(new_rel),
                         "description": desc, "status": status,
