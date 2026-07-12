@@ -141,17 +141,22 @@ def compress(src: Path, tmp_dir: Path) -> Path:
     # 临时文件名必须纯 ASCII:上传 SDK 会把文件名放进 HTTP 头,中文名会报编码错
     safe = hashlib.md5(str(src).encode()).hexdigest()[:16]
     dst = tmp_dir / f"clip-{safe}.mp4"
-    cmd = [
+    common = [
         "ffmpeg", "-nostdin", "-y", "-v", "error",
-        "-i", str(src),
-        "-t", str(MAX_CLIP_SECONDS),
-        "-vf", "scale=-2:360,fps=2",
+        "-i", str(src), "-t", str(MAX_CLIP_SECONDS),
+    ]
+    tail = [
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "32",
         "-c:a", "aac", "-b:a", "48k", "-ac", "1",
-        "-movflags", "+faststart",
-        str(dst),
+        "-movflags", "+faststart", str(dst),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(common + ["-vf", "scale=-2:360,fps=2"] + tail,
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        # ffmpeg 8 的 scale 滤镜对个别文件报 "Impossible to convert between formats";
+        # 降级为不缩放、仅降帧率的纯转码(这类文件通常分辨率本来就不高)
+        result = subprocess.run(common + ["-r", "2"] + tail,
+                                capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg 压缩失败: {result.stderr.strip()[:300]}")
     return dst
