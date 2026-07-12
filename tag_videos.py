@@ -21,16 +21,16 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
-MODEL = "gemini-2.5-flash-lite"
+MODEL = "gemini-3.1-flash-lite"
 TAG_PREFIX = "[AI] "  # 已处理标记:元数据描述以此开头的视频会被跳过
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv"}
 EMBEDDABLE_EXTS = {".mp4", ".mov", ".m4v"}  # exiftool 无法写入 avi/mkv,这两类只记 CSV
 MAX_CLIP_SECONDS = 600  # 超长视频只取前 10 分钟
 CSV_NAME = "tagged_videos.csv"
 
-# Flash-Lite 标准价,用于结束时估算花费(美元/百万 token)
-PRICE_INPUT = 0.10
-PRICE_OUTPUT = 0.40
+# 3.1 Flash-Lite 标准价,用于结束时估算花费(美元/百万 token;音频 token 按 $0.50 计,此处不细分,估算略偏低)
+PRICE_INPUT = 0.25
+PRICE_OUTPUT = 1.50
 
 class BillingError(RuntimeError):
     """账户额度耗尽等不可重试错误,应中止整个运行而不是逐个视频重试。"""
@@ -126,7 +126,7 @@ def compress(src: Path, tmp_dir: Path) -> Path:
     return dst
 
 
-def describe(client: genai.Client, clip: Path, retries: int = 4) -> tuple[str, str, int, int]:
+def describe(client: genai.Client, clip: Path, model: str = MODEL, retries: int = 4) -> tuple[str, str, int, int]:
     """上传压缩片段并生成描述。返回 (描述, 文件名短语, 输入token, 输出token)。"""
     uploaded = client.files.upload(file=str(clip))
     try:
@@ -143,7 +143,7 @@ def describe(client: genai.Client, clip: Path, retries: int = 4) -> tuple[str, s
         for attempt in range(retries + 1):
             try:
                 resp = client.models.generate_content(
-                    model=MODEL,
+                    model=model,
                     contents=[uploaded, PROMPT],
                     config=genai_types.GenerateContentConfig(
                         response_mime_type="application/json",
@@ -213,6 +213,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="只生成描述并打印,不写入文件")
     parser.add_argument("--force", action="store_true", help="重新处理已有 [AI] 描述的视频")
     parser.add_argument("--no-rename", action="store_true", help="只写元数据,不改文件名")
+    parser.add_argument("--model", default=MODEL, help=f"Gemini 模型名(默认 {MODEL})")
     parser.add_argument("--sleep", type=float, default=0, help="每个视频之间的间隔秒数(免费额度限速时用)")
     args = parser.parse_args()
 
@@ -246,7 +247,7 @@ def main() -> int:
             start = time.monotonic()
             try:
                 clip = compress(video, tmp_dir)
-                desc, slug, tok_in, tok_out = describe(client, clip)
+                desc, slug, tok_in, tok_out = describe(client, clip, model=args.model)
                 clip.unlink(missing_ok=True)
                 total_in += tok_in
                 total_out += tok_out
