@@ -32,6 +32,10 @@ CSV_NAME = "tagged_videos.csv"
 PRICE_INPUT = 0.10
 PRICE_OUTPUT = 0.40
 
+class BillingError(RuntimeError):
+    """账户额度耗尽等不可重试错误,应中止整个运行而不是逐个视频重试。"""
+
+
 PROMPT = (
     "分析这个视频,返回 JSON,包含两个字段:\n"
     "description:用一两句中文描述这个视频大概拍了什么——有哪些人物、什么场景、在做什么活动;"
@@ -148,6 +152,9 @@ def describe(client: genai.Client, clip: Path, retries: int = 4) -> tuple[str, s
                 )
                 break
             except genai_errors.APIError as e:
+                msg = str(e)
+                if e.code == 429 and ("credits are depleted" in msg or "billing" in msg.lower()):
+                    raise BillingError(msg)
                 retryable = e.code in (429, 500, 502, 503, 504)
                 if not retryable or attempt == retries:
                     raise
@@ -269,6 +276,10 @@ def main() -> int:
                     note = "(仅记入 CSV,该格式无法嵌入)" if status == "csv-only" else ""
                     print(f"[{i}/{len(videos)}] 完成{note}: {rel} → {new_rel}\n    → {desc}")
                 done += 1
+            except BillingError as e:
+                failed += 1
+                print(f"\n中止:API 额度已耗尽,请到 https://ai.studio/projects 处理账单后重跑。\n{e}", file=sys.stderr)
+                break
             except Exception as e:
                 failed += 1
                 print(f"[{i}/{len(videos)}] 失败: {rel} — {e}", file=sys.stderr)
