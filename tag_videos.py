@@ -65,6 +65,32 @@ def find_videos(root: Path) -> list[Path]:
     return videos
 
 
+def _parse_shot_date(raw: str) -> str | None:
+    """把 exiftool 的日期字符串转成本地日期 yyyy-mm-dd。
+
+    Keys:CreationDate 自带时区偏移(本地时间),日期直接用;
+    CreateDate/MediaCreateDate 无偏移,按 QuickTime 规范视为 UTC,转本地时区
+    (否则傍晚拍的视频日期会多一天)。年份不合理(设备乱写)则放弃该字段。
+    """
+    m = re.match(
+        r"(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?",
+        raw,
+    )
+    if not m:
+        return None
+    y = int(m.group(1))
+    if not (1980 <= y <= datetime.date.today().year + 1):
+        return None
+    if m.group(7):  # 带时区偏移 → 已是本地时间
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    dt = datetime.datetime(
+        y, int(m.group(2)), int(m.group(3)),
+        int(m.group(4)), int(m.group(5)), int(m.group(6)),
+        tzinfo=datetime.timezone.utc,
+    )
+    return dt.astimezone().date().isoformat()
+
+
 def read_metadata(path: Path) -> tuple[str | None, str | None]:
     """返回 (已有描述, 拍摄日期 yyyy-mm-dd)。日期取不到时退回文件修改时间。"""
     out = subprocess.run(
@@ -81,11 +107,8 @@ def read_metadata(path: Path) -> tuple[str | None, str | None]:
             data = {}
         desc = data.get("Description") or data.get("Comment")
         for key in ("CreationDate", "CreateDate", "MediaCreateDate"):
-            raw = str(data.get(key) or "")
-            m = re.match(r"(\d{4}):(\d{2}):(\d{2})", raw)
-            # QuickTime 未知日期常写成 0000:00:00,要排除
-            if m and m.group(1) != "0000":
-                date = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+            date = _parse_shot_date(str(data.get(key) or ""))
+            if date:
                 break
     if date is None:
         date = datetime.date.fromtimestamp(path.stat().st_mtime).isoformat()
