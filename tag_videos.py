@@ -343,6 +343,8 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=4, help="并行处理数(默认 4)")
     parser.add_argument("--people", type=Path, default=None,
                         help="人物名册文本文件,帮助模型认出家庭成员(样例见 people.example.txt)")
+    parser.add_argument("--files", type=Path, default=None,
+                        help="只处理清单文件里列出的视频(每行一个路径,绝对路径或相对 folder)")
     parser.add_argument("--sleep", type=float, default=0, help="每个视频之间的间隔秒数(免费额度限速时用)")
     args = parser.parse_args()
 
@@ -362,7 +364,21 @@ def main() -> int:
 
     client = genai.Client()
     csv_path = args.folder / CSV_NAME
-    videos = find_videos(args.folder)
+    if args.files:
+        videos = []
+        for line in args.files.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            p = Path(line)
+            if not p.is_absolute():
+                p = args.folder / p
+            if p.is_file():
+                videos.append(p)
+            else:
+                print(f"警告:清单中的文件不存在,跳过: {line}", file=sys.stderr)
+    else:
+        videos = find_videos(args.folder)
     if args.limit:
         videos = videos[: args.limit]
     print(f"找到 {len(videos)} 个视频待处理")
