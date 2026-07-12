@@ -8,6 +8,7 @@
 import argparse
 import csv
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -135,7 +136,9 @@ def unique_target(current: Path, stem: str, ext: str) -> Path:
 
 
 def compress(src: Path, tmp_dir: Path) -> Path:
-    dst = tmp_dir / (src.stem + ".compressed.mp4")
+    # 临时文件名必须纯 ASCII:上传 SDK 会把文件名放进 HTTP 头,中文名会报编码错
+    safe = hashlib.md5(str(src).encode()).hexdigest()[:16]
+    dst = tmp_dir / f"clip-{safe}.mp4"
     cmd = [
         "ffmpeg", "-nostdin", "-y", "-v", "error",
         "-i", str(src),
@@ -176,7 +179,6 @@ def describe(client: genai.Client, clip: Path, model: str = MODEL, retries: int 
                         response_schema=RESPONSE_SCHEMA,
                     ),
                 )
-                break
             except genai_errors.APIError as e:
                 msg = str(e)
                 if e.code == 429 and ("credits are depleted" in msg or "billing" in msg.lower()):
@@ -186,6 +188,15 @@ def describe(client: genai.Client, clip: Path, model: str = MODEL, retries: int 
                     raise
                 time.sleep(delay)
                 delay *= 2
+                continue
+            if (resp.text or "").strip():
+                break
+            # 空响应是偶发的服务端抖动,同样重试
+            reason = resp.candidates[0].finish_reason if resp.candidates else None
+            if attempt == retries:
+                raise RuntimeError(f"模型多次返回空响应 (finish_reason={reason})")
+            time.sleep(delay)
+            delay *= 2
 
         try:
             data = json.loads(resp.text or "")
